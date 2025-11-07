@@ -1,0 +1,665 @@
+---
+title: "RNA-seq_SunZ"
+author: "SZ"
+date: "2025-07-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("E:\\BaiduSyncdisk\\Project\\SunZhi\\")
+#setwd("F:\\Project_cloud\\BaiduSyncdisk\\Project\\SunZhi")
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{shell}
+# 质控
+ls /data/zhushi/RNA-seq/*/*fastq |xargs fastqc -t 50 -o /data/zhushi/RNA-seq/output
+multiqc /data/SunZ/ANNO_XS01KF2024050333_PM-XS01KF2024050333-123/Rawdata/
+
+# 清洗成clean data
+  #!/bin/bash
+
+# 创建输出目录
+mkdir -p trimmed_fastq
+
+# 设置输入文件路径
+RAW_DIR="Rawdata"
+OUT_DIR="trimmed_fastq"
+
+# 遍历每对fastq文件进行清洗
+for fq1 in ${RAW_DIR}/*/*_R1.fastq.gz; do
+    fq2="${fq1/_R1/_R2}"
+    sample=$(basename $fq1 | sed 's/_R1\.fastq\.gz//')
+
+    echo "Processing sample: ${sample}"
+
+    /data/software/TrimGalore-0.6.10/trim_galore \
+        --paired \
+        --cores 4 \
+        --illumina \
+        --quality 30 \
+        --stringency 5 \
+        --length 30 \
+        --fastqc \
+        --output_dir ${OUT_DIR} \
+        ${fq1} ${fq2}
+done
+
+#!/bin/bash
+
+# 输入和输出目录
+RAW_DIR="Rawdata"
+OUT_DIR="trimmed_fastq"
+
+# 创建输出目录
+mkdir -p ${OUT_DIR}
+
+# 遍历子目录中的 fastq 文件
+for sample_dir in ${RAW_DIR}/*; do
+    if [ -d "${sample_dir}" ]; then
+        fq1=$(find "${sample_dir}" -type f -name "*_R1*.fq.gz" | head -n 1)
+        fq2=$(find "${sample_dir}" -type f -name "*_R2*.fq.gz" | head -n 1)
+
+        # 检查是否找到配对文件
+        if [[ -n "${fq1}" && -n "${fq2}" ]]; then
+            sample_name=$(basename "${sample_dir}")
+            echo "Processing ${sample_name}"
+
+            /data/software/TrimGalore-0.6.10/trim_galore \
+                --paired \
+                --illumina \
+                --quality 30 \
+                --stringency 5 \
+                --length 30 \
+                --fastqc \
+                --cores 8 \
+                --output_dir ${OUT_DIR} \
+                "${fq1}" "${fq2}"
+        else
+            echo "⚠️  Warning: Skipped ${sample_dir} - R1/R2 fastq not found."
+        fi
+    fi
+done
+
+
+#定量
+
+## hisat2 参考基因组索引下载
+wget -c https://genome-idx.s3.amazonaws.com/hisat/grch38_genome.tar.gz
+
+## hisat2 比对
+for i in `cat samplelist`
+do
+cat >> bam.sh <<cmd
+hisat2 -p 12 -t -x /data/SunZ/refindex/grch38/genome -1 /data/SunZ/trimmed_fastq/${i}_R1_val_1.fq.gz -2 /data/SunZ/trimmed_fastq/${i}_R2_val_2.fq.gz -S ${i}.sam; samtools view -@ 24 -b ${i}.sam > ${i}.bam; samtools sort -@ 24 ${i}.bam -o ${i}.sorted.bam; samtools index -@ 24 ${i}.sorted.bam 
+cmd
+done
+
+## stringtie 定量
+
+#!/bin/bash
+
+GTF=/data/SunZ/refindex/Homo_sapiens.GRCh38.114.gtf
+STRINGTIE=/data/xup/stringtie/stringtie
+
+for bam in *.sorted.bam; do
+    sample=$(basename "$bam" .sorted.bam)
+    $STRINGTIE -G $GTF -o ${sample}.gtf -e -B -p 8 $bam
+done
+
+/data/xup/stringtie/prepDE.py3 -i samplelist
+```
+
+# Differential analysis
+
+
+```{r pressure, echo=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+
+raw <- read.csv("gene_count_matrix.csv", header = TRUE, check.names = FALSE)
+gene_ids <- sapply(strsplit(raw$gene_id, "\\|"), `[`, 1)
+counts <- raw[, -1]
+rownames(counts) <- gene_ids
+
+# 确保所有列是 numeric
+counts[] <- lapply(counts, as.numeric)
+
+# 清除 NA 行
+counts_clean <- counts[complete.cases(counts), ]
+
+sample_names <- colnames(counts_clean)
+group <- sub("-.*", "", sample_names)  # 提取组别
+
+# 构造分组信息
+coldata <- data.frame(row.names = sample_names,
+                      condition = factor(group, levels = c("N", "D", "R", "S")))
+
+# 创建输出文件夹
+dir.create("DEG_results", showWarnings = FALSE)
+
+# 构建 DESeq 对象
+dds <- DESeqDataSetFromMatrix(countData = round(counts_clean), colData = coldata, design = ~ condition)
+dds <- DESeq(dds, fitType = "local")
+
+# 样本相关性热图（使用 ggplot2）
+vsd_all <- vst(dds, blind = TRUE)
+cor_mat <- cor(assay(vsd_all))
+cor_df <- as.data.frame(as.table(cor_mat))
+colnames(cor_df) <- c("Sample1", "Sample2", "Correlation")
+
+pdf("DEG_results/Sample_Correlation_Heatmap.pdf", width = 6, height = 6)
+ggplot(cor_df, aes(Sample1, Sample2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "white", mid = "pink", high = "red", 
+                       midpoint = 0.9969, limits = c(0.9950, 1), space = "Lab") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sample Correlation Heatmap", x = NULL, y = NULL)
+dev.off()
+
+compare_groups <- c("S", "R", "D")
+
+for (grp in compare_groups) {
+  message(paste("Processing:", grp, "vs N"))
+
+  res <- results(dds, contrast = c("condition", grp, "N"))
+  res <- lfcShrink(dds, coef = paste0("condition_", grp, "_vs_N"), res = res)
+  res_df <- as.data.frame(res)
+  res_df$gene <- rownames(res_df)
+  res_df <- res_df[complete.cases(res_df), ]
+
+  # 添加每组均值表达
+  grp_samples <- rownames(coldata)[coldata$condition == grp]
+  ctrl_samples <- rownames(coldata)[coldata$condition == "N"]
+  res_df$mean_expr_grp <- rowMeans(counts_clean[res_df$gene, grp_samples, drop = FALSE])
+  res_df$mean_expr_ctrl <- rowMeans(counts_clean[res_df$gene, ctrl_samples, drop = FALSE])
+
+  write.csv(res_df, file = paste0("DEG_results/DEG_", grp, "_vs_N.csv"), row.names = FALSE)
+
+  # 添加分组信息
+  res_df$Group <- "NotSig"
+  res_df$Group[res_df$log2FoldChange > 3.32 & res_df$padj < 0.01] <- "Up"
+  res_df$Group[res_df$log2FoldChange < -3.32 & res_df$padj < 0.01] <- "Down"
+
+  # ggplot2 火山图：复刻喜欢的风格
+  pdf(paste0("DEG_results/Volcano_", grp, "_vs_N.pdf"), width = 5, height = 5)
+  p <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), colour = Group)) +
+    geom_point(size = 2.5, shape = 20, stroke = 0.5) +
+    scale_color_manual(values = c("Down" = "dodgerblue", "NotSig" = "gray", "Up" = "tomato")) +
+    ylab("-log10 (Adjusted P-value)") +
+    xlab("log2 (FoldChange)") +
+    geom_vline(xintercept = c(-3.32, 3.32), lty = 2, col = "black", lwd = 0.5) +
+    geom_hline(yintercept = -log10(0.01), lty = 2, col = "black", lwd = 0.5) +
+    theme_minimal() +
+    theme(axis.line = element_line())
+  print(p)
+  dev.off()
+
+  # 上下调基因筛选
+  up_genes <- rownames(res_df[res_df$log2FoldChange > 3.32 & res_df$padj < 0.01, ])
+  down_genes <- rownames(res_df[res_df$log2FoldChange < -3.32 & res_df$padj < 0.01, ])
+
+  up_ids <- bitr(up_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  down_ids <- bitr(down_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+  ego_up <- if (nrow(up_ids) > 0) enrichGO(gene = up_ids$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", readable = TRUE) else NULL
+  ego_down <- if (nrow(down_ids) > 0) enrichGO(gene = down_ids$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", readable = TRUE) else NULL
+  ekegg_up <- if (nrow(up_ids) > 0) enrichKEGG(gene = up_ids$ENTREZID, organism = 'hsa') else NULL
+  ekegg_down <- if (nrow(down_ids) > 0) enrichKEGG(gene = down_ids$ENTREZID, organism = 'hsa') else NULL
+
+  if (!is.null(ego_up) && nrow(ego_up) > 0) write.csv(as.data.frame(ego_up), file = paste0("DEG_results/GO_up_", grp, "_vs_N.csv"), row.names = FALSE)
+  if (!is.null(ego_down) && nrow(ego_down) > 0) write.csv(as.data.frame(ego_down), file = paste0("DEG_results/GO_down_", grp, "_vs_N.csv"), row.names = FALSE)
+  if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) write.csv(as.data.frame(ekegg_up), file = paste0("DEG_results/KEGG_up_", grp, "_vs_N.csv"), row.names = FALSE)
+  if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) write.csv(as.data.frame(ekegg_down), file = paste0("DEG_results/KEGG_down_", grp, "_vs_N.csv"), row.names = FALSE)
+
+  if (!is.null(ego_up) && nrow(ego_up) > 0) {
+    pdf(paste0("DEG_results/GO_up_", grp, "_barplot.pdf"), width = 5, height = 5)
+    print(barplot(ego_up, showCategory = 10, title = paste("GO Upregulated:", grp)))
+    dev.off()
+  }
+  if (!is.null(ego_down) && nrow(ego_down) > 0) {
+    pdf(paste0("DEG_results/GO_down_", grp, "_barplot.pdf"), width = 5, height = 5)
+    print(barplot(ego_down, showCategory = 10, title = paste("GO Downregulated:", grp)))
+    dev.off()
+  }
+  if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) {
+    pdf(paste0("DEG_results/KEGG_up_", grp, "_barplot.pdf"), width = 5, height = 5)
+    print(barplot(ekegg_up, showCategory = 10, title = paste("KEGG Upregulated:", grp)))
+    dev.off()
+  }
+  if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) {
+    pdf(paste0("DEG_results/KEGG_down_", grp, "_barplot.pdf"), width = 5, height = 5)
+    print(barplot(ekegg_down, showCategory = 10, title = paste("KEGG Downregulated:", grp)))
+    dev.off()
+  }
+
+  # PCA 图，添加置信区间
+  dds_sub <- dds[, dds$condition %in% c("N", grp)]
+  vsd <- vst(dds_sub, blind = TRUE)
+  pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+  pdf(paste0("DEG_results/PCA_", grp, "_vs_N.pdf"), width = 7, height = 6)
+  print(
+    ggplot(pcaData, aes(PC1, PC2, color = condition, fill = condition)) +
+      stat_ellipse(geom = "polygon", alpha = 0.2, linetype = 2) +
+      geom_point(size = 3) +
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+      ggtitle(paste0("PCA: ", grp, " vs N")) +
+      theme_minimal()
+  )
+  dev.off()
+}
+
+```
+
+
+
+
+```{r pressure, echo=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+# 定义通用绘图函数
+plot_enrich_bar <- function(enrich_result, title, filename) {
+  require(ggplot2)
+  require(dplyr)
+  
+  # 结果转为数据框并处理
+  df <- as.data.frame(enrich_result) %>%
+    # 计算GeneRatio数值
+    mutate(GeneRatio_num = sapply(strsplit(GeneRatio, "/"), 
+                                 function(x) as.numeric(x[1])/as.numeric(x[2]))) %>%
+    # 过滤显著结果并排序
+    filter(p.adjust <= 0.05) %>%
+    arrange(p.adjust) %>%
+    # 取最显著的前10个
+    slice_head(n = 10) 
+  
+  if (nrow(df) == 0) return()
+  
+  # 按GeneRatio排序因子水平（确保绘图顺序）
+  df <- df %>% 
+    arrange(desc(GeneRatio_num)) %>%  # 改为降序排列，高比例值在顶部
+    mutate(Description = factor(Description, levels = rev(unique(Description))))
+  
+  # 创建条形图
+  p <- ggplot(df, aes(x = GeneRatio_num, y = Description, fill = p.adjust)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    # 设置横坐标范围和刻度
+    scale_x_continuous(
+      limits = c(0, 0.5),
+      breaks = seq(0, 0.5, by = 0.1),  # 固定刻度为0,0.1,0.2,0.3,0.4,0.5
+      expand = expansion(mult = c(0, 0.05))  # 右侧留5%空白
+    ) +
+    scale_fill_gradient(
+      low = "#ec8574", 
+      high = "gray",
+      limits = c(0, 0.05),  # 固定颜色范围
+      name = "p.adjust",
+      guide = guide_colorbar(reverse = TRUE)  # 反转图例（红在上）
+    ) +
+    labs(
+      title = title, 
+      x = "GeneRatio", 
+      y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major.y = element_blank(),
+      legend.position = "right",
+      legend.key.height = unit(0.8, "cm")
+    )
+  
+  # 保存图形
+  ggsave(
+    filename = filename,
+    plot = p,
+    width = 7,  # 适当增加宽度以避免标签重叠
+    height = 5
+  )
+}
+
+```
+
+### new plot enrich
+
+
+```{r}
+plot_enrich_bar <- function(enrich_result, title, filename) {
+  require(ggplot2)
+  require(dplyr)
+  
+  # 结果转为数据框并处理
+  df <- as.data.frame(enrich_result) %>%
+    # 计算GeneRatio数值
+    mutate(GeneRatio_num = sapply(strsplit(GeneRatio, "/"), 
+                                 function(x) as.numeric(x[1])/as.numeric(x[2]))) %>%
+    # 过滤显著结果并排序
+    filter(p.adjust <= 0.05) %>%
+    arrange(p.adjust) %>%
+    # 取最显著的前10个
+    slice_head(n = 10) 
+  
+  if (nrow(df) == 0) return()
+  
+  # 按GeneRatio排序因子水平（确保绘图顺序）
+  df <- df %>% 
+    arrange(desc(GeneRatio_num)) %>%  # 改为降序排列，高比例值在顶部
+    mutate(Description = factor(Description, levels = rev(unique(Description))))
+  
+  # 创建条形图
+  p <- ggplot(df, aes(x = RichFactor, y = Description, fill = p.adjust)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    # 设置横坐标范围和刻度
+    scale_x_continuous(
+      limits = c(0, 0.2),
+      breaks = seq(0, 0.2, by = 0.05),  # 固定刻度为0,0.1,0.2,0.3,0.4,0.5
+      expand = expansion(mult = c(0, 0.05))  # 右侧留5%空白
+    ) +
+    scale_fill_gradient(
+      low = "#ec8574", 
+      high = "gray",
+      limits = c(0, 0.05),  # 固定颜色范围
+      name = "p.adjust",
+      guide = guide_colorbar(reverse = TRUE)  # 反转图例（红在上）
+    ) +
+    labs(
+      title = title, 
+      x = "RichFactor", 
+      y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major.y = element_blank(),
+      legend.position = "right",
+      legend.key.height = unit(0.8, "cm")
+    )
+  
+  # 保存图形
+  ggsave(
+    filename = filename,
+    plot = p,
+    width = 7,  # 适当增加宽度以避免标签重叠
+    height = 5
+  )
+}
+  
+
+```
+
+```{r}
+raw <- read.csv("gene_count_matrix.csv", header = TRUE, check.names = FALSE)
+gene_ids <- sapply(strsplit(raw$gene_id, "\\|"), `[`, 1)
+counts <- raw[, -1]
+rownames(counts) <- gene_ids
+
+# 确保所有列是 numeric
+counts[] <- lapply(counts, as.numeric)
+
+# 清除 NA 行
+counts_clean <- counts[complete.cases(counts), ]
+
+sample_names <- colnames(counts_clean)
+group <- sub("-.*", "", sample_names)  # 提取组别
+
+# 构造分组信息
+coldata <- data.frame(row.names = sample_names,
+                      condition = factor(group, levels = c("N", "D", "R", "S")))
+
+# 创建输出文件夹
+dir.create("DEG_results", showWarnings = FALSE)
+
+# 构建 DESeq 对象
+dds <- DESeqDataSetFromMatrix(countData = round(counts_clean), colData = coldata, design = ~ condition)
+dds <- DESeq(dds, fitType = "local")
+
+# 样本相关性热图（使用 ggplot2）
+vsd_all <- vst(dds, blind = TRUE)
+cor_mat <- cor(assay(vsd_all))
+cor_df <- as.data.frame(as.table(cor_mat))
+colnames(cor_df) <- c("Sample1", "Sample2", "Correlation")
+
+pdf("DEG_results/Sample_Correlation_Heatmap.pdf", width = 6, height = 6)
+ggplot(cor_df, aes(Sample1, Sample2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "white", mid = "pink", high = "red", 
+                       midpoint = 0.9969, limits = c(0.9950, 1), space = "Lab") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Sample Correlation Heatmap", x = NULL, y = NULL)
+dev.off()
+
+compare_groups <- c("S", "R", "D")
+
+for (grp in compare_groups) {
+  message(paste("Processing:", grp, "vs N"))
+
+  res <- results(dds, contrast = c("condition", grp, "N"))
+  res <- lfcShrink(dds, coef = paste0("condition_", grp, "_vs_N"), res = res)
+  res_df <- as.data.frame(res)
+  res_df$gene <- rownames(res_df)
+  res_df <- res_df[complete.cases(res_df), ]
+
+  # 添加每组均值表达
+  grp_samples <- rownames(coldata)[coldata$condition == grp]
+  ctrl_samples <- rownames(coldata)[coldata$condition == "N"]
+  res_df$mean_expr_grp <- rowMeans(counts_clean[res_df$gene, grp_samples, drop = FALSE])
+  res_df$mean_expr_ctrl <- rowMeans(counts_clean[res_df$gene, ctrl_samples, drop = FALSE])
+
+  write.csv(res_df, file = paste0("DEG_results/DEG_", grp, "_vs_N.csv"), row.names = FALSE)
+
+  # 添加分组信息
+  res_df$Group <- "NotSig"
+  res_df$Group[res_df$log2FoldChange > 3.32 & res_df$padj < 0.01] <- "Up"
+  res_df$Group[res_df$log2FoldChange < -3.32 & res_df$padj < 0.01] <- "Down"
+
+  # ggplot2 火山图：复刻喜欢的风格
+  pdf(paste0("DEG_results/Volcano_", grp, "_vs_N.pdf"), width = 5, height = 5)
+  p <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), colour = Group)) +
+    geom_point(size = 2.5, shape = 20, stroke = 0.5) +
+    scale_color_manual(values = c("Down" = "dodgerblue", "NotSig" = "gray", "Up" = "tomato")) +
+    ylab("-log10 (Adjusted P-value)") +
+    xlab("log2 (FoldChange)") +
+    geom_vline(xintercept = c(-3.32, 3.32), lty = 2, col = "black", lwd = 0.5) +
+    geom_hline(yintercept = -log10(0.01), lty = 2, col = "black", lwd = 0.5) +
+    theme_minimal() +
+    theme(axis.line = element_line())
+  print(p)
+  dev.off()
+
+  # 上下调基因筛选
+  up_genes <- rownames(res_df[res_df$log2FoldChange > 3.32 & res_df$padj < 0.01, ])
+  down_genes <- rownames(res_df[res_df$log2FoldChange < -3.32 & res_df$padj < 0.01, ])
+
+  up_ids <- bitr(up_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  down_ids <- bitr(down_genes, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+      ego_up <- if (nrow(up_ids) > 0) enrichGO(gene = up_ids$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", readable = TRUE) else NULL
+    ego_down <- if (nrow(down_ids) > 0) enrichGO(gene = down_ids$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", readable = TRUE) else NULL
+    ekegg_up <- if (nrow(up_ids) > 0) enrichKEGG(gene = up_ids$ENTREZID, organism = 'hsa') else NULL
+    #ekegg_up<-read.csv("./DEG_results/KEGG_up_R_vs_N.csv",header =T)
+    ekegg_down <- if (nrow(down_ids) > 0) enrichKEGG(gene = down_ids$ENTREZID, organism = 'hsa') else NULL
+    if (!is.null(ego_up) && nrow(ego_up) > 0) write.csv(as.data.frame(ego_up), file = paste0("DEG_results/GO_up_", grp, "_vs_N.csv"), row.names = FALSE)
+    if (!is.null(ego_down) && nrow(ego_down) > 0) write.csv(as.data.frame(ego_down), file = paste0("DEG_results/GO_down_", grp, "_vs_N.csv"), row.names = FALSE)
+    if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) write.csv(as.data.frame(ekegg_up), file = paste0("DEG_results/KEGG_up_", grp, "_vs_N.csv"), row.names = FALSE)
+    if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) write.csv(as.data.frame(ekegg_down), file = paste0("DEG_results/KEGG_down_", grp, "_vs_N.csv"), row.names = FALSE)
+  ego_up<-read.csv("DEG_results/GO_up_S_vs_N.csv",header = T)
+  grp<-"D"
+  ekegg_up<-read.csv("DEG_results/KEGG_up_D_vs_N.csv",header = T)
+  # 应用绘图函数（替换原barplot代码）
+  if (!is.null(ego_up) && nrow(ego_up) > 0) {
+    plot_enrich_bar(
+      ego_up,
+      title = paste("GO Upregulated:", grp),
+      filename = paste0("DEG_results/GO_up_", grp, "_barplot.pdf")
+    )
+  }
+  
+  if (!is.null(ego_down) && nrow(ego_down) > 0) {
+    plot_enrich_bar(
+      ego_down,
+      title = paste("GO Downregulated:", grp),
+      filename = paste0("DEG_results/GO_down_", grp, "_barplot.pdf")
+    )
+  }
+  
+  if (!is.null(ekegg_up) && nrow(ekegg_up) > 0) {
+    plot_enrich_bar(
+      ekegg_up,
+      title = paste("KEGG Upregulated:", grp),
+      filename = paste0("DEG_results/KEGG_up_", grp, "_barplot.pdf")
+    )
+  }
+  
+  if (!is.null(ekegg_down) && nrow(ekegg_down) > 0) {
+    plot_enrich_bar(
+      ekegg_down,
+      title = paste("KEGG Downregulated:", grp),
+      filename = paste0("DEG_results/KEGG_down_", grp, "_barplot.pdf")
+    )
+  }
+  # PCA 图，添加置信区间
+  dds_sub <- dds[, dds$condition %in% c("N", grp)]
+  vsd <- vst(dds_sub, blind = TRUE)
+  pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+  pdf(paste0("DEG_results/PCA_", grp, "_vs_N.pdf"), width = 7, height = 6)
+  print(
+    ggplot(pcaData, aes(PC1, PC2, color = condition, fill = condition)) +
+      stat_ellipse(geom = "polygon", alpha = 0.2, linetype = 2) +
+      geom_point(size = 3) +
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+      ggtitle(paste0("PCA: ", grp, " vs N")) +
+      theme_minimal()
+  )
+  dev.off()
+}
+
+```
+
+```{r}
+
+ggplot(data = data, aes(x = Description, y = ratio, fill = idx)) +
+  geom_col() +
+  theme_bw() +
+  scale_y_continuous(limits = c(-0.1,0.1)) +
+  ylab("Ratio") +
+  xlab("")+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.line.x = element_line(colour = "black"),
+        legend.title = element_text(size = 10, color = "black"),
+        legend.text = element_text(colour = "black"),
+        legend.background = element_blank(),
+        legend.box.background = element_blank()) +
+  geom_hline(yintercept = 0, color = "black") +
+  coord_flip() +
+  scale_fill_manual(values = c("#74c2d7","#ec8574"))+
+  geom_text(data = data[data$idx == "Up",], aes(x = Description, y = -0.001, label = Description),
+            hjust = 1, size = 3.5,  color = "black") +
+
+  geom_text(data = data[data$idx == "Down",], aes(x = Description, y = 0.001, label = Description),
+            hjust = 0, size = 3.5, color = "black")
+```
+run_deseq_contrast <- function(counts, coldata, contrast_group) {
+  dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata, design = ~ condition)
+  dds <- DESeq(dds)
+  res <- results(dds, contrast = c("condition", contrast_group, "N")) # 比较 contrast_group vs N
+  res_df <- as.data.frame(res) %>% 
+    rownames_to_column("gene_id") %>% 
+    drop_na(log2FoldChange, padj)
+  return(res_df)
+}
+
+plot_volcano <- function(res_df, title) {
+  EnhancedVolcano(res_df,
+                  lab = res_df$gene_id,
+                  x = "log2FoldChange",
+                  y = "padj",
+                  pCutoff = 0.05,
+                  FCcutoff = 1,
+                  title = title,
+                  subtitle = "padj < 0.05, |log2FC| > 1",
+                  pointSize = 2.5,
+                  labSize = 3.5)
+}
+
+run_enrichment <- function(res_df, type = c("up", "down")) {
+  # 按方向筛选
+  if (type == "up") {
+    gene_list <- res_df %>% filter(log2FoldChange > 1, padj < 0.05)
+  } else {
+    gene_list <- res_df %>% filter(log2FoldChange < -1, padj < 0.05)
+  }
+  # 提取ENSEMBL ID并转为ENTREZ ID
+  ens_ids <- gene_list$gene_id
+  entrez_ids <- mapIds(org.Hs.eg.db, keys = ens_ids, column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first")
+  entrez_ids <- na.omit(entrez_ids)
+  # GO富集
+  ego <- enrichGO(gene = entrez_ids,
+                  OrgDb = org.Hs.eg.db,
+                  keyType = "ENTREZID",
+                  ont = "BP",
+                  pAdjustMethod = "BH",
+                  qvalueCutoff = 0.05,
+                  readable = TRUE)
+  # KEGG富集
+  ekegg <- enrichKEGG(gene = entrez_ids,
+                      organism = "hsa",
+                      pAdjustMethod = "BH",
+                      qvalueCutoff = 0.05)
+
+  return(list(GO = ego, KEGG = ekegg))
+}
+
+# S vs N
+res_S <- run_deseq_contrast(counts, coldata, "S")
+plot_volcano(res_S, "S vs N")
+enrich_S_up <- run_enrichment(res_S, "up")
+enrich_S_down <- run_enrichment(res_S, "down")
+
+# R vs N
+res_R <- run_deseq_contrast(counts, coldata, "R")
+plot_volcano(res_R, "R vs N")
+enrich_R_up <- run_enrichment(res_R, "up")
+enrich_R_down <- run_enrichment(res_R, "down")
+
+# D vs N
+res_D <- run_deseq_contrast(counts, coldata, "D")
+plot_volcano(res_D, "D vs N")
+enrich_D_up <- run_enrichment(res_D, "up")
+enrich_D_down <- run_enrichment(res_D, "down")
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
